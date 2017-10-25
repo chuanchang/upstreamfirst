@@ -1,0 +1,50 @@
+---
+# vim: set ft=ansible:
+#
+#  This role sets facts for the current booted deployment
+#
+#  Optionally, you can archive the values to an YAML file that will drop into
+#  the current playbook directory.
+#
+- name: Set archive value
+  set_fact:
+    bdsf_archive: "{{ archive | default('false') }}"
+    bdsf_ansible_host: "{{ ansible_host }}"
+
+- name: Get rpm-ostree status output
+  command: rpm-ostree status --json
+  register: bdsf_ros_status
+
+- name: Set json output
+  set_fact:
+     bdsf_ros_json: "{{ bdsf_ros_status.stdout | from_json }}"
+
+- name: Discover the booted deployment
+  set_fact:
+    bdsf_ros_booted: "{{ item }}"
+  with_items: "{{ bdsf_ros_json | json_query('deployments[?booted]') }}"
+
+- name: Save refspec and checksum
+  set_fact:
+    bdsf_saved_checksum: "{{ bdsf_ros_booted['checksum'] }}"
+    # If the host is on a local branch, we have to skip splitting the 'origin'
+    # because there is no remote portion
+    bdsf_saved_refspec: "{{ bdsf_ros_booted['origin'].split(':')[1] if ':' in bdsf_ros_booted['origin'] else bdsf_ros_booted['origin'] }}"
+    bdsf_saved_remote_name: "{{ bdsf_ros_booted['origin'].split(':')[0] if ':' in bdsf_ros_booted['origin'] else '' }}"
+
+# If 'bdsf_archve' is true, we setup the following global variables in a YAML
+# file:
+#  - g_archive_checksum
+#  - g_archive_refspec
+#  - g_archive_remote_name
+- block:
+  - name: Remove existing archive file
+    local_action:
+      file path="{{ playbook_dir }}/{{ bdsf_ansible_host }}_bdsf_archive.yml" state=absent
+    become: false
+
+  - name: Archive refspec and checksum
+    local_action:
+      template src=bdsf_archive.j2 dest="{{ playbook_dir }}/{{ bdsf_ansible_host }}_bdsf_archive.yml"
+    become: false
+  when: bdsf_archive

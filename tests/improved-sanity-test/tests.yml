@@ -1,0 +1,795 @@
+---
+# vim: set ft=ansible:
+#
+# !!!NOTE!!! This playbook was tested using Ansible 2.2; it is recommended
+# that the same version is used.
+#
+# This playbook is actually multiple playbooks contained in a single file.
+# I had to take this approach, because I encountered difficulties re-using
+# the same roles with non-unique variables.  Sometimes the roles would be
+# executed with the use of the 'always' tag, sometimes not.
+#
+# The wrinkle in this approach is that sharing global variables across the
+# multiple playbooks requires the use of a file containing the variables
+# which is included in each playbook with the 'vars_files' directive.
+#
+# The sanity tests performed in this set of playbooks:
+#   - check permissions on /tmp are correct (RHBZ 1276775) after each reboot
+#   - add user to system, verify it is present after upgrade
+#   - make changes to /etc, verify changes are present after upgrade
+#   - add directory/file to /var, verify they persist after upgrade/rollback
+#   - add user post-upgrade, verify it is not present after rollback
+#   - add directory/file to /var post-upgrade, verify they persist after
+#     rollback
+#
+# The intent is to expand the sanity test coverage in this set of playbooks
+# with small, focused tests going forward.  Additional functional tests that
+# are more expansive should be handled in separate playbooks.
+#
+- name: Improved Sanity Test - Pre-Upgrade
+  #  hosts: all
+  hosts: localhost
+  become: yes
+  force_handlers: true
+
+  tags:
+    - atomic
+    - pre_upgrade
+
+  vars_files:
+    - "vars/common.yml"
+
+  roles:
+    # This playbook requires Ansible 2.2 and an Atomic Host
+    - role: ansible_version_check
+      avc_major: "2"
+      avc_minor: "2"
+      tags:
+        - ansible_version_check
+
+    - role: handler_notify_on_failure
+      handler_name: h_get_journal
+      tags:
+        - handler_notify_on_failure
+
+    - role: atomic_host_check
+      tags:
+        - atomic_host_check
+
+    # Before we do anything substantial, let's check the journal to see if
+    # anything blew up on boot
+    - role: journal_fatal_msgs
+      tags:
+        - journal_fatal_msgs_first_boot
+        - journal_fatal_msgs
+
+    # Check RPM signatures
+    - role: rpm_signature_verify
+      tags:
+        - rpm_signature_verify
+
+    # Subscribe if the system is RHEL
+    - role: redhat_subscription
+      when: ansible_distribution == 'RedHat'
+      tags:
+        - redhat_subscription
+
+    # The 'archive' option will drop a YAML file into the playbook directory
+    # with the value of the original checksum, refspec, and remote
+    - role: booted_deployment_set_fact
+      archive: yes
+      tags:
+        - booted_deployment_set_fact
+
+    # Setup local branch and upgrade right away so packages are layered on top of
+    # the local branch.  If the local branch is created before the upgrade later in
+    # the test, it will only contain the origin content of the ostree.
+    - role: local_branch_setup
+      branch_name: local-branch
+      tags:
+        - local_branch_setup
+
+    - role: local_branch_commit
+      branch_name: local-branch
+      refspec: local-branch
+      version: test1
+      tags:
+        - local_branch_commit
+
+    # origin_file_modify
+    - role: origin_file_modify
+      refspec: local-branch
+      tags:
+        - origin_file_modify
+
+    - role: rpm_ostree_upgrade
+      tags:
+        - rpm_ostree_upgrade_setup
+
+    - role: reboot
+      wait_for_services:
+        - docker
+      tags:
+        - reboot_setup
+
+    # Set some facts that are used in multiple roles
+    - role: osname_set_fact
+      tags:
+        - osname_set_fact
+
+    # Verify that rpm-ostree can be run as non-root or sudo
+    - role: command_privilege_verify
+      cmd: rpm-ostree status
+      user: bin
+      expect_failure: false
+      tags:
+        - command_privilege_verify
+
+    # Verify that the output from 'atomic host status' matches 'rpm-ostree status'
+    - role: atomic_host_status_verify
+      tags:
+        - atomic_host_status_verify
+
+    # Verify SELinux labels are correct
+    - role: selinux_verify
+      tags:
+        - selinux_verify
+
+    # Verify that SELinux file contexts can be modified
+    - role: semanage_fcontext_mod
+      test_dir_match: "{{ g_semanage_test_dir_match }}"
+      test_context: "{{ g_semanage_test_context }}"
+      tags:
+        - semanage_fcontext_mod
+
+    - name: semanage_fcontext_verify
+      test_dir: "{{ g_semanage_test_dir }}"
+      test_context: "{{ g_semanage_test_context }}"
+      tags:
+        - semanage_fcontext_verify
+
+    - role: selinux_boolean
+      tags:
+        - selinux_boolean
+
+    # Verify that the Docker storage defaults are correct
+    - role: docker_storage_verify
+      tags:
+        - docker_storage_verify
+
+    # Verify that 'docker pull' is successful. (Note: this is a different
+    # operation than 'atomic pull')
+    - role: docker_pull_run_remove
+      tags:
+        - docker_pull_run_remove
+
+    # Validate 'atomic pull', 'atomic scan' works correctly.
+    # Remove images after test of each command.
+    # Do this ahead of 'ostree admin unlock' because of overlay + SELinux
+    # incompatibility on RHEL. (This should be fixed in 7.4)
+    - role: atomic_pull_verify
+      tags:
+        - atomic_pull_verify
+
+    - role: docker_remove_all
+      tags:
+        - docker_remove_all
+
+    - role: atomic_scan_verify
+      tags:
+        - atomic_scan_verify
+
+    - role: docker_remove_all
+      tags:
+        - docker_remove_all
+
+    # Install package using package layering
+    - role: rpm_ostree_install
+      roi_packages: "{{ g_pkg }}"
+      roi_reboot: false
+      tags:
+        - rpm_ostree_install
+
+    - role: reboot
+      wait_for_services:
+        - docker
+      tags:
+        - reboot_pre_up_install
+
+    - role: rpm_ostree_install_verify
+      roiv_package_name: "{{ g_pkg }}"
+      roiv_binary_name: "{{ g_pkg }}"
+      tags:
+        - rpm_ostree_install_verify
+
+    # Verify admin unlock by installing an RPM
+    - role: ostree_admin_unlock_hotfix
+      tags:
+        - ostree_admin_unlock_hotfix
+
+    - role: overlayfs_verify_present
+      tags:
+        - overlayfs_verify_present
+
+    - role: rpm_install
+      rpm_url: "{{ g_rpm_url }}"
+      tags:
+        - rpm_install
+
+    - role: package_verify_present
+      rpm_name: "{{ g_rpm_name }}"
+      check_binary: false
+      tags:
+        - package_verify_present
+
+    # Check that /tmp has the proper permissions
+    - role: tmp_check_perms
+      tags:
+        - tmp_check_perms
+
+    # Check that the RPM database is functional
+    - role: rpmdb_verify
+      tags:
+        - rpmdb_verify
+
+    # Add users, make changes to /etc, and add things to /var before the
+    # the system is upgraded
+    - role: user_add
+      ua_uid: "{{ g_uid1 }}"
+      tags:
+        - user_add
+
+    - role: user_verify_present
+      uvp_uid: "{{ g_uid1 }}"
+      tags:
+        - user_verify_present
+
+    - role: etc_modify
+      tags:
+        - etc_modify
+
+    - role: etc_verify_changes
+      tags:
+        - etc_verify_changes
+
+    - role: var_add_files
+      vaf_filename: "{{ g_file1 }}"
+      vaf_dirname: "{{ g_dir1 }}"
+      tags:
+        - var_add_files
+
+    - role: var_files_present
+      vfp_filename: "{{ g_file1 }}"
+      vfp_dirname: "{{ g_dir1 }}"
+      tags:
+        - var_files_present
+
+    # Pull down docker base images, build a layered image, run it, then
+    # remove the container.  But we keep the image around to run later.
+    # Run 'atomic run/stop' tests prior to running 'docker run' test so
+    # the built images can be run later.
+    - role: docker_pull_base_image
+      tags:
+        - docker_pull_base_image
+
+    - role: docker_build_httpd
+      tags:
+        - docker_build_httpd
+
+    - role: atomic_run_verify
+      container: "{{ g_httpd_name }}"
+      tags:
+        - atomic_run_verify
+
+    - role: atomic_stop_verify
+      container: "{{ g_httpd_name }}"
+      tags:
+        - atomic_stop_verify
+
+    - role: docker_rm_httpd_container
+      tags:
+        - docker_rm_httpd_container
+
+    - role: docker_run_httpd
+      tags:
+        - docker_run_httpd
+
+    - role: docker_rm_httpd_container
+      tags:
+        - docker_rm_httpd_container
+
+    # Install, run and uninstall cockpit using atomic command
+    - role: atomic_installation_verify
+      tags:
+        - atomic_installation_verify
+
+    # new commit
+    - role: local_branch_commit
+      branch_name: local-branch
+      refspec: local-branch
+      version: test2
+      tags:
+        - local_branch_commit
+      check_mode: no
+
+    # Install etcd system container
+    - role: etcd_sys_container_install
+      tags:
+        - etcd_sys_container_install
+
+    # Upgrade and reboot
+    - role: rpm_ostree_upgrade
+      tags:
+        - rpm_ostree_upgrade
+      check_mode: no
+
+    # Before we reboot, check the journal for anything that blew up
+    - role: journal_fatal_msgs
+      tags:
+        - journal_fatal_msgs_reboot
+        - journal_fatal_msgs
+
+    - role: reboot
+      wait_for_services:
+        - docker
+      tags:
+        - reboot_pre_upgrade
+
+- name: Improved Sanity Test - Post-Upgrade
+  #hosts: all
+  hosts: localhost
+  become: yes
+  force_handlers: true
+
+  tags:
+    - atomic
+    - post_upgrade
+
+  vars_files:
+    - "vars/common.yml"
+    - [ "vars/{{ ansible_distribution|lower }}.yml", "vars/os_defaults.yml" ]
+
+  roles:
+    # This playbook requires Ansible 2.2 and an Atomic Host
+    - role: ansible_version_check
+      avc_major: "2"
+      avc_minor: "2"
+      tags:
+        - ansible_version_check
+
+    - role: handler_notify_on_failure
+      handler_name: h_get_journal
+      tags:
+        - handler_notify_on_failure
+      check_mode: no
+
+    - role: atomic_host_check
+      tags:
+        - atomic_host_check
+
+    # Setup facts again. (Need to use the 'check_mode: no' option to ensure the
+    # role runs again)
+    - role: osname_set_fact
+      tags:
+        - osname_set_fact
+      check_mode: no
+
+    # Before we do any additional actions, let's check the journal to see if
+    # anything blew up after reboot
+    - role: journal_fatal_msgs
+      tags:
+        - journal_fatal_msgs_second_boot
+        - journal_fatal_msgs
+
+    # We remove any subscriptions after the upgrade to verify that
+    # 'rpm-ostree status' with the 'unconfigured-state' field present.
+    # https://bugzilla.redhat.com/show_bug.cgi?id=1421867
+    - role: redhat_unsubscribe
+      unconfigured_state: true
+      when: ansible_distribution == 'RedHat'
+      tags:
+        - redhat_unsubscribe
+
+    # Verify that rpm-ostree can be run as non-root or sudo
+    - role: command_privilege_verify
+      cmd: rpm-ostree status
+      user: bin
+      expect_failure: false
+      tags:
+        - command_privilege_verify
+
+    # Compare 'atomic host status' and 'rpm-ostree status' again
+    - role: atomic_host_status_verify
+      stop_daemon: true
+      tags:
+        - atomic_host_status_verify
+
+    # Re-subscribe
+    - role: redhat_subscription
+      when: ansible_distribution == 'RedHat'
+      tags:
+        - redhat_subscription
+
+    # Verify correct SELinux labels again
+    - role: selinux_verify
+      tags:
+        - selinux_verify
+
+    # Verify the change to the SELinux file context persisted
+    - role: semanage_fcontext_verify
+      test_dir: "{{ g_semanage_test_dir }}"
+      test_context: "{{ g_semanage_test_context }}"
+      tags:
+        - semanage_fcontext_verify
+
+    # Verify the SELinux boolean changes
+    - role: selinux_boolean_verify
+      tags:
+        - selinux_boolean_verify
+
+    # Verify that the Docker storage defaults haven't changed
+    - role: docker_storage_verify
+      tags:
+        - docker_storage_verify
+
+    - role: docker_pull_run_remove
+      tags:
+        - docker_pull_run_remove
+
+    # Check layered package is still installed
+    - role: rpm_ostree_install_verify
+      roiv_package_name: "{{ g_pkg }}"
+      roiv_binary_name: "{{ g_pkg }}"
+      tags:
+        - rpm_ostree_install_verify
+
+    # Check etcd system container is still running
+    - role: command
+      cmd: systemctl status etcd
+      output: 'active (running)'
+      tags:
+        - command
+
+    # Uninstall etcd system container
+    - role: atomic_system_uninstall
+      name: etcd
+      tags:
+        - atomic_system_uninstall
+
+    # Verify etcd system container uninstall
+    - role: atomic_system_uninstall_verify
+      image: etcd
+      tags:
+        - atomic_system_uninstall_verify
+
+    # Install etcd system container
+    - role: etcd_sys_container_install
+      delete_key: True
+      tags:
+        - etcd_sys_container_install
+        - cloud_image
+      check_mode: no
+
+    # Uninstall etcd system container
+    - role: atomic_system_uninstall
+      name: etcd
+      tags:
+        - atomic_system_uninstall
+        - cloud_image
+      check_mode: no
+
+    # Verify etcd system container uninstall
+    - role: atomic_system_uninstall_verify
+      image: etcd
+      tags:
+        - atomic_system_uninstall_verify
+        - cloud_image
+
+    - role: rpm_ostree_install
+      roi_packages: "{{ g_ros_install_pkg }}"
+      roi_reboot: false
+      tags:
+        - rpm_ostree_install
+
+    - role: reboot
+      tags:
+        - reboot_post_up_install
+
+    - role: rpm_ostree_install_verify
+      roiv_package_name: "{{ g_pkg }}"
+      roiv_binary_name: "{{ g_pkg }}"
+      tags:
+        - rpm_ostree_install_verify
+
+    - role: rpm_ostree_install_verify
+      roiv_package_name: "{{ g_ros_install_pkg }}"
+      roiv_binary_name: "{{ g_ros_install_bin }}"
+      tags:
+        - rpm_ostree_install_verify
+
+    - role: httpd_start
+      httpd_port: 8080
+      when: ansible_distribution != 'CentOS'
+      tags:
+        - httpd_start
+
+    - role: url_verify
+      url: http://atomic:8080
+      destination: /dev/null
+      when: ansible_distribution != 'CentOS'
+      tags:
+        - url_verify
+
+    # Check admin unlock overlayfs is no longer there after upgrade
+    - role: overlayfs_verify_missing
+      tags:
+        - overlayfs_verify_missing
+
+    # Verify admin unlocked package is removed after upgrade
+    - role: package_verify_missing
+      rpm_name: "{{ g_rpm_name }}"
+      tags:
+        - package_verify_missing
+
+    # Check that /tmp is properly setup again
+    - role: tmp_check_perms
+      tags:
+        - tmp_check_perms
+
+    # Check that the RPM database is functional again
+    - role: rpmdb_verify
+      tags:
+        - rpmdb_verify
+
+    # Verify that the new users, /etc changes, and /var additions are still
+    # present after the upgrade
+    - role: user_verify_present
+      uvp_uid: "{{ g_uid1 }}"
+      tags:
+        - user_verify_present
+
+    - role: etc_verify_changes
+      tags:
+        - etc_verify_changes
+
+    - role: var_files_present
+      vfp_filename: "{{ g_file1 }}"
+      vfp_dirname: "{{ g_dir1 }}"
+      tags:
+        - var_files_present
+
+    # Add more users and more files to /var ahead of the rollback
+    - role: user_add
+      ua_uid: "{{ g_uid2 }}"
+      tags:
+        - user_add
+
+    - role: user_verify_present
+      uvp_uid: "{{ g_uid2 }}"
+      tags:
+        - user_verify_present
+
+    - role: var_add_files
+      vaf_filename: "{{ g_file2 }}"
+      vaf_dirname: "{{ g_dir2 }}"
+      tags:
+        - var_add_files
+
+    - role: var_files_present
+      vfp_filename: "{{ g_file2 }}"
+      vfp_dirname: "{{ g_dir2 }}"
+      tags:
+        - var_files_present
+
+    # Install, run and uninstall cockpit using atomic command
+    - role: atomic_installation_verify
+      tags:
+        - atomic_installation_verify
+
+    # Run the previously created docker layered image, then remove the container and the image.
+    - role: atomic_run_verify
+      container: "{{ g_httpd_name }}"
+      tags:
+        - atomic_run_verify
+
+    - role: atomic_stop_verify
+      container: "{{ g_httpd_name }}"
+      tags:
+        - atomic_stop_verify
+
+    - role: docker_rm_httpd_container
+      tags:
+        - docker_rm_httpd_container
+
+    - role: docker_rmi_httpd_image
+      tags:
+        - docker_rmi_httpd_image
+
+    - role: docker_remove_all
+      tags:
+        - docker_remove_all
+
+    # Validate 'atomic' commands again.
+    - role: atomic_pull_verify
+      tags:
+        - atomic_pull_verify
+
+    - role: docker_remove_all
+      tags:
+        - docker_remove_all
+
+    - role: atomic_scan_verify
+      tags:
+        - atomic_scan_verify
+
+    # Rollback and reboot
+    - role: rpm_ostree_rollback
+      tags:
+        - rpm_ostree_rollback
+
+    # Before we reboot, check the journal for anything that blew up
+    - role: journal_fatal_msgs
+      tags:
+        - journal_fatal_msgs_second_reboot
+        - journal_fatal_msgs
+
+    - role: reboot
+      wait_for_services:
+        - docker
+      tags:
+        - reboot_post_upgrade
+
+- name: Improved Sanity Test - Post-Rollback
+  #hosts: all
+  hosts: localhost
+  become: yes
+  force_handlers: true
+
+  tags:
+    - atomic
+    - post_rollback
+
+  vars_files:
+    - "vars/common.yml"
+    - [ "vars/{{ ansible_distribution|lower }}.yml", "vars/os_defaults.yml" ]
+
+  roles:
+    # This playbook requires Ansible 2.2 and an Atomic Host
+    - role: ansible_version_check
+      avc_major: "2"
+      avc_minor: "2"
+      tags:
+        - ansible_version_check
+
+    - role: handler_notify_on_failure
+      handler_name: h_get_journal
+      tags:
+        - handler_notify_on_failure
+      check_mode: no
+
+    - role: atomic_host_check
+      tags:
+        - atomic_host_check
+
+    # Before we do any additional actions, let's check the journal to see if
+    # anything blew up after reboot
+    - role: journal_fatal_msgs
+      tags:
+        - journal_fatal_msgs_third_boot
+        - journal_fatal_msgs
+
+    - role: selinux_verify
+      tags:
+        - selinux_verify
+
+    # Verify that the change to the SELinux file context still exists in
+    # the original deployment
+    - role: semanage_fcontext_verify
+      test_dir: "{{ g_semanage_test_dir }}"
+      test_context: "{{ g_semanage_test_context }}"
+      tags:
+        - semanage_fcontext_verify
+
+    # Check layered package is still installed
+    - role: rpm_ostree_install_verify
+      roiv_package_name: "{{ g_pkg }}"
+      roiv_binary_name: "{{ g_pkg }}"
+      tags:
+        - rpm_ostree_install_verify
+
+    # Check second package is not installed
+    - role: rpm_ostree_uninstall_verify
+      rouv_package_name: "{{ g_ros_install_pkg }}"
+      rouv_binary_name: "{{ g_ros_install_bin }}"
+      tags:
+        - rpm_ostree_uninstall_verify
+
+    # Check admin unlock overlayfs missing
+    - role: overlayfs_verify_missing
+      tags:
+        - overlayfs_verify_missing
+
+    # Check that /tmp is properly setup yet again
+    - role: tmp_check_perms
+      tags:
+        - tmp_check_perms
+
+    # Check that the RPM database is functional yet again
+    - role: rpmdb_verify
+      tags:
+        - rpmdb_verify
+
+    # Verify changes still exist in original tree
+    - role: etc_verify_changes
+      tags:
+        - etc_verify_changes
+
+    # Verify first user added is still present in original tree
+    - role: user_verify_present
+      uvp_uid: "{{ g_uid1 }}"
+      tags:
+        - user_verify_present
+
+    # Verify first files dropped in /var are still in original tree
+    - role: var_files_present
+      vfp_filename: "{{ g_file1 }}"
+      vfp_dirname: "{{ g_dir1 }}"
+      tags:
+        - var_files_present
+
+    # Verify that the newest user is not present in the previous tree
+    - role: user_verify_missing
+      uvm_uid: "{{ g_uid2 }}"
+      tags:
+        - user_verify_missing
+
+    # Verify the most recent changes to /var are present
+    - role: var_files_present
+      vfp_filename: "{{ g_file2 }}"
+      vfp_dirname: "{{ g_dir2 }}"
+      tags:
+        - var_files_present
+
+    # use 'all' keyword to remove all installed pacakges
+    - role: rpm_ostree_uninstall
+      rou_packages: all
+      rou_reboot: true
+      tags:
+        - rpm_ostree_uninstall
+
+    # load in the YAML files with archived deployment info
+    - role: load_variables
+      filename: "{{ playbook_dir}}/{{ ansible_host }}_bdsf_archive.yml"
+      tags:
+        - load_variables
+
+    # rebase back to original checkout
+    - role: rpm_ostree_rebase
+      remote_name: "{{ g_archive_remote_name }}"
+      refspec: "{{ g_archive_refspec }}"
+      commit: "{{ g_archive_checksum }}"
+      tags:
+        - rpm_ostree_rebase
+
+    - role: reboot
+      wait_for_services:
+        - docker
+      tags:
+        - reboot_cleanup
+
+    # cleanup any extra deployments
+    - role: rpm_ostree_cleanup_all
+      tags:
+        - rpm_ostree_cleanup_all
+
+    # cleanup our subscriptions because we are nice people
+    - role: redhat_unsubscribe
+      when: ansible_distribution == 'RedHat'
+      tags:
+        - redhat_unsubscribe
+
+    # As the final action, check the journal for any fatal problems
+    - role: journal_fatal_msgs
+      tags:
+        - journal_fatal_msgs_final
+        - journal_fatal_msgs
